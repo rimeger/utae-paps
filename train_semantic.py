@@ -128,7 +128,7 @@ def iterate(
         y = y.long()
 
         if mode != "train":
-            with torch.no_grad():
+            with torch.inference_mode():
                 out = model(x, batch_positions=dates)
         else:
             optimizer.zero_grad()
@@ -139,7 +139,7 @@ def iterate(
             loss.backward()
             optimizer.step()
 
-        with torch.no_grad():
+        with torch.inference_mode():
             pred = out.argmax(dim=1)
         iou_meter.add(pred, y)
         loss_meter.add(loss.item())

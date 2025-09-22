@@ -216,7 +216,7 @@ def iterate(
         (x, dates), y = batch
 
         if mode != "train":
-            with torch.no_grad():
+            with torch.inference_mode():
                 predictions = model(
                     x,
                     batch_positions=dates,
