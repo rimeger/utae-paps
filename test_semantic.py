@@ -105,6 +105,7 @@ def main(config):
             shuffle=True,
             drop_last=True,
             collate_fn=collate_fn,
+            pin_memory=True,
         )
 
         # Load weights

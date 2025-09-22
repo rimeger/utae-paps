@@ -269,6 +269,7 @@ def main(config):
             shuffle=True,
             drop_last=True,
             collate_fn=collate_fn,
+            pin_memory=True,
         )
         val_loader = data.DataLoader(
             dt_val,
@@ -276,6 +277,7 @@ def main(config):
             shuffle=True,
             drop_last=True,
             collate_fn=collate_fn,
+            pin_memory=True,
         )
         test_loader = data.DataLoader(
             dt_test,
@@ -283,6 +285,7 @@ def main(config):
             shuffle=True,
             drop_last=True,
             collate_fn=collate_fn,
+            pin_memory=True,
         )
 
         print(
