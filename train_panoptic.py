@@ -216,7 +216,7 @@ def iterate(
         (x, dates), y = batch
 
         if mode != "train":
-            with torch.inference_mode():
+            with torch.no_grad():
                 predictions = model(
                     x,
                     batch_positions=dates,
@@ -394,7 +394,6 @@ def main(config):
             shuffle=True,
             drop_last=True,
             collate_fn=pad_collate,
-            pin_memory=True,
         )
         val_loader = data.DataLoader(
             dt_val,
@@ -403,7 +402,6 @@ def main(config):
             drop_last=True,
             collate_fn=pad_collate,
             num_workers=config.num_workers,
-            pin_memory=True,
         )
         test_loader = data.DataLoader(
             dt_test,
@@ -412,7 +410,6 @@ def main(config):
             drop_last=True,
             collate_fn=pad_collate,
             num_workers=config.num_workers,
-            pin_memory=True,
         )
 
         print(

@@ -131,3 +131,8 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+PASTIS/
+pastis-r-panoptic-utae/
+pastis-r-semantic-utae/
+pastis-semantic-utae/

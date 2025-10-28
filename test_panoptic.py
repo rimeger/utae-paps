@@ -103,7 +103,6 @@ def main(config):
             drop_last=True,
             collate_fn=pad_collate,
             num_workers=config.num_workers,
-            pin_memory=True,
         )
 
         # Load weights

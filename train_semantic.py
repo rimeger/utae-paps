@@ -128,7 +128,7 @@ def iterate(
         y = y.long()
 
         if mode != "train":
-            with torch.inference_mode():
+            with torch.no_grad():
                 out = model(x, batch_positions=dates)
         else:
             optimizer.zero_grad()
@@ -139,7 +139,7 @@ def iterate(
             loss.backward()
             optimizer.step()
 
-        with torch.inference_mode():
+        with torch.no_grad():
             pred = out.argmax(dim=1)
         iou_meter.add(pred, y)
         loss_meter.add(loss.item())
@@ -269,7 +269,6 @@ def main(config):
             shuffle=True,
             drop_last=True,
             collate_fn=collate_fn,
-            pin_memory=True,
         )
         val_loader = data.DataLoader(
             dt_val,
@@ -277,7 +276,6 @@ def main(config):
             shuffle=True,
             drop_last=True,
             collate_fn=collate_fn,
-            pin_memory=True,
         )
         test_loader = data.DataLoader(
             dt_test,
@@ -285,7 +283,6 @@ def main(config):
             shuffle=True,
             drop_last=True,
             collate_fn=collate_fn,
-            pin_memory=True,
         )
 
         print(
