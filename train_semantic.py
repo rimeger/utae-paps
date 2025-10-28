@@ -105,9 +105,42 @@ parser.add_argument(
     type=int,
     help="Do validation only after that many epochs.",
 )
+parser.add_argument(
+    "--lr_power",
+    default=2.0,
+    type=float,
+    help="Exponent for learning rate scheduler"
+)
+parser.add_argument(
+    "--lr_mode",
+    default=None,
+    type=str,
+    help="Mode for learning rate scheduler. options: 511, 512, poly, or None"
+)
 
 list_args = ["encoder_widths", "decoder_widths", "out_conv"]
 parser.set_defaults(cache=False)
+
+
+def lr_lambda_511(epoch, config):
+    """Eq. 5.11 — decays for first 30 epochs, then constant."""
+    if epoch < 30:
+        return (1 - epoch / 30) ** config.lr_power
+    else:
+        return (1 - 29 / 30) ** config.lr_power
+
+
+def lr_lambda_512(epoch, config):
+    """Eq. 5.12 — decays for first 30 epochs, then continues decaying."""
+    if epoch < 30:
+        return (1 - epoch / 30) ** config.lr_power
+    else:
+        return ((1 - 29 / 30) ** config.lr_power) * (1 - epoch / config.epochs) ** config.lr_power
+
+
+def lr_lambda_poly(epoch, config):
+    """Standard polynomial decay."""
+    return (1 - epoch / config.epochs) ** config.lr_power
 
 
 def iterate(
@@ -306,6 +339,21 @@ def main(config):
         # Optimizer and Loss
         optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
+        if config.lr_mode == "511":
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=lambda epoch: lr_lambda_511(epoch, config)
+            )
+        elif config.lr_mode == "512":
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=lambda epoch: lr_lambda_512(epoch, config)
+            )
+        elif config.lr_mode == "poly":
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=lambda epoch: lr_lambda_poly(epoch, config)
+            )
+        else:
+            scheduler = None
+
         weights = torch.ones(config.num_classes, device=device).float()
         weights[config.ignore_index] = 0
         criterion = nn.CrossEntropyLoss(weight=weights)
@@ -326,6 +374,11 @@ def main(config):
                 mode="train",
                 device=device,
             )
+
+            if scheduler is not None:
+                scheduler.step()
+                print("Learning rate:", scheduler.get_last_lr())
+
             if epoch % config.val_every == 0 and epoch > config.val_after:
                 print("Validation . . . ")
                 model.eval()

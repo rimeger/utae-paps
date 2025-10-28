@@ -178,12 +178,45 @@ parser.add_argument(
     action="store_true",
     help="If specified, the whole dataset is kept in RAM",
 )
+parser.add_argument(
+    "--lr_power",
+    default=2.0,
+    type=float,
+    help="Exponent for learning rate scheduler"
+)
+parser.add_argument(
+    "--lr_mode",
+    default=None,
+    type=str,
+    help="Mode for learning rate scheduler. options: 511, 512, poly, or default"
+)
 
 list_args = ["encoder_widths", "decoder_widths", "out_conv"]
 
 parser.set_defaults(
     cache=False, mask_conv=True, supmax=True, autotune=True, val_metrics_only=False
 )
+
+
+def lr_lambda_511(epoch, config):
+    """Eq. 5.11 — decays for first 30 epochs, then constant."""
+    if epoch < 30:
+        return (1 - epoch / 30) ** config.lr_power
+    else:
+        return (1 - 29 / 30) ** config.lr_power
+
+
+def lr_lambda_512(epoch, config):
+    """Eq. 5.12 — decays for first 30 epochs, then continues decaying."""
+    if epoch < 30:
+        return (1 - epoch / 30) ** config.lr_power
+    else:
+        return ((1 - 29 / 30) ** config.lr_power) * (1 - epoch / config.epochs) ** config.lr_power
+
+
+def lr_lambda_poly(epoch, config):
+    """Standard polynomial decay."""
+    return (1 - epoch / config.epochs) ** config.lr_power
 
 
 def iterate(
@@ -430,9 +463,23 @@ def main(config):
 
         model = model.to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer=optimizer, milestones=[60, 80], gamma=0.3
-        )
+
+        if config.lr_mode == "511":
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=lambda epoch: lr_lambda_511(epoch, config)
+            )
+        elif config.lr_mode == "512":
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=lambda epoch: lr_lambda_512(epoch, config)
+            )
+        elif config.lr_mode == "poly":
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=lambda epoch: lr_lambda_poly(epoch, config)
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                optimizer=optimizer, milestones=[60, 80], gamma=0.3
+            )
 
         model.apply(weight_init)
         trainlog = {}
@@ -466,6 +513,7 @@ def main(config):
 
             trainlog[epoch] = {**train_metrics}
             scheduler.step()
+            print("Learning rate:", scheduler.get_last_lr())
             if (
                 epoch > config.warmup
                 and epoch % config.val_every == 0
