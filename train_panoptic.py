@@ -186,7 +186,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--lr_mode",
-    default=None,
+    default="default",
     type=str,
     help="Mode for learning rate scheduler. options: 511, 512, poly, or default"
 )
