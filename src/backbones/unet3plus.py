@@ -123,14 +123,51 @@ class UNet3Plus(nn.Module):
             ] + [ConvBlock(self.filters[4], output_channels, n=1, is_bn=False, is_relu=False)]
         ) if self.deep_supervision else None
 
-    def forward(self, x, batch_positions=None) -> torch.Tensor:
+    def forward(self, x, batch_positions=None, **kwargs) -> torch.Tensor:
+        """
+        Support both 4-D inputs (B, C, H, W) and 5-D temporal inputs (B, T, C, H, W).
+        This implements a small "smart forward" behaviour: modules that are 2D
+        (conv blocks) are applied per-frame when the input is 5-D by flattening
+        the (B, T) dims before applying them, while functional ops (pool/interp)
+        are also applied per-frame. Concatenation across channels is handled
+        for both cases.
+        """
         training = self.training
-        # Encoder
-        e1 = self.e1(x)
-        e2 = self.e2(e1)
-        e3 = self.e3(e2)
-        e4 = self.e4(e3)
-        e5 = self.e5(e4)
+        is_temporal = x.dim() == 5
+        if is_temporal:
+            b, t, _, _, _ = x.shape
+
+        def apply_module(mod, inp):
+            # Apply a nn.Module that expects 4-D input to either 4-D or 5-D tensors.
+            if inp.dim() == 4:
+                return mod(inp)
+            b, t, c, h, w = inp.shape
+            out = mod(inp.view(b * t, c, h, w))
+            _, oc, oh, ow = out.shape
+            return out.view(b, t, oc, oh, ow)
+
+        def apply_fn(fn, inp, *args, **kwargs):
+            # Apply a functional that expects 4-D input (like F.max_pool2d / F.interpolate)
+            if inp.dim() == 4:
+                return fn(inp, *args, **kwargs)
+            b, t, c, h, w = inp.shape
+            out = fn(inp.view(b * t, c, h, w), *args, **kwargs)
+            # out is expected 4-D
+            _, oc, oh, ow = out.shape
+            return out.view(b, t, oc, oh, ow)
+
+        def cat_channels(tensors):
+            # Concatenate along channel dimension for 4-D and 5-D tensors
+            if tensors[0].dim() == 4:
+                return torch.cat(tensors, dim=1)
+            else:
+                return torch.cat(tensors, dim=2)
+        # Encoder (use smart apply so modules work with 4-D or 5-D inputs)
+        e1 = apply_module(self.e1, x)
+        e2 = apply_module(self.e2, e1)
+        e3 = apply_module(self.e3, e2)
+        e4 = apply_module(self.e4, e3)
+        e5 = apply_module(self.e5, e4)
 
         # Classification Guided Module
         if self.CGM:
@@ -139,49 +176,49 @@ class UNet3Plus(nn.Module):
 
         # Decoder
         d4 = [
-            F.max_pool2d(e1, 8),
-            F.max_pool2d(e2, 4),
-            F.max_pool2d(e3, 2),
+            apply_fn(F.max_pool2d, e1, 8),
+            apply_fn(F.max_pool2d, e2, 4),
+            apply_fn(F.max_pool2d, e3, 2),
             e4,
-            F.interpolate(e5, scale_factor=2, mode='bilinear', align_corners=True)
+            apply_fn(F.interpolate, e5, scale_factor=2, mode='bilinear', align_corners=True),
         ]
-        d4 = [conv(d) for conv, d in zip(self.d4, d4)]
-        d4 = torch.cat(d4, dim=1)
-        d4 = self.d4_conv(d4)
+        d4 = [apply_module(conv, d) for conv, d in zip(self.d4, d4)]
+        d4 = cat_channels(d4)
+        d4 = apply_module(self.d4_conv, d4)
 
         d3 = [
-            F.max_pool2d(e1, 4),
-            F.max_pool2d(e2, 2),
+            apply_fn(F.max_pool2d, e1, 4),
+            apply_fn(F.max_pool2d, e2, 2),
             e3,
-            F.interpolate(d4, scale_factor=2, mode='bilinear', align_corners=True),
-            F.interpolate(e5, scale_factor=4, mode='bilinear', align_corners=True)
+            apply_fn(F.interpolate, d4, scale_factor=2, mode='bilinear', align_corners=True),
+            apply_fn(F.interpolate, e5, scale_factor=4, mode='bilinear', align_corners=True),
         ]
-        d3 = [conv(d) for conv, d in zip(self.d3, d3)]
-        d3 = torch.cat(d3, dim=1)
-        d3 = self.d3_conv(d3)
+        d3 = [apply_module(conv, d) for conv, d in zip(self.d3, d3)]
+        d3 = cat_channels(d3)
+        d3 = apply_module(self.d3_conv, d3)
 
         d2 = [
-            F.max_pool2d(e1, 2),
+            apply_fn(F.max_pool2d, e1, 2),
             e2,
-            F.interpolate(d3, scale_factor=2, mode='bilinear', align_corners=True),
-            F.interpolate(d4, scale_factor=4, mode='bilinear', align_corners=True),
-            F.interpolate(e5, scale_factor=8, mode='bilinear', align_corners=True)
+            apply_fn(F.interpolate, d3, scale_factor=2, mode='bilinear', align_corners=True),
+            apply_fn(F.interpolate, d4, scale_factor=4, mode='bilinear', align_corners=True),
+            apply_fn(F.interpolate, e5, scale_factor=8, mode='bilinear', align_corners=True),
         ]
-        d2 = [conv(d) for conv, d in zip(self.d2, d2)]
-        d2 = torch.cat(d2, dim=1)
-        d2 = self.d2_conv(d2)
+        d2 = [apply_module(conv, d) for conv, d in zip(self.d2, d2)]
+        d2 = cat_channels(d2)
+        d2 = apply_module(self.d2_conv, d2)
 
         d1 = [
             e1,
-            F.interpolate(d2, scale_factor=2, mode='bilinear', align_corners=True),
-            F.interpolate(d3, scale_factor=4, mode='bilinear', align_corners=True),
-            F.interpolate(d4, scale_factor=8, mode='bilinear', align_corners=True),
-            F.interpolate(e5, scale_factor=16, mode='bilinear', align_corners=True)
+            apply_fn(F.interpolate, d2, scale_factor=2, mode='bilinear', align_corners=True),
+            apply_fn(F.interpolate, d3, scale_factor=4, mode='bilinear', align_corners=True),
+            apply_fn(F.interpolate, d4, scale_factor=8, mode='bilinear', align_corners=True),
+            apply_fn(F.interpolate, e5, scale_factor=16, mode='bilinear', align_corners=True),
         ]
-        d1 = [conv(d) for conv, d in zip(self.d1, d1)]
-        d1 = torch.cat(d1, dim=1)
-        d1 = self.d1_conv(d1)
-        d1 = self.final(d1)
+        d1 = [apply_module(conv, d) for conv, d in zip(self.d1, d1)]
+        d1 = cat_channels(d1)
+        d1 = apply_module(self.d1_conv, d1)
+        d1 = apply_module(self.final, d1)
 
         outputs = [d1]
 
@@ -199,7 +236,12 @@ class UNet3Plus(nn.Module):
             outputs = [dot_product(out, cls) for out in outputs]
         
         outputs = [F.sigmoid(out) for out in outputs]
-        
+
+        if is_temporal:
+            # reshape each output from (B*T, C, H, W) -> (B, T, C, H, W) and
+            # aggregate over time (mean). This yields (B, C, H, W) per output.
+            outputs = [out.view(b, t, out.shape[1], out.shape[2], out.shape[3]).mean(dim=1) for out in outputs]
+
         if self.deep_supervision and training:
             return torch.cat(outputs, dim=0)
         else:
