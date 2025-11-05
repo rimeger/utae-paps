@@ -1,4 +1,4 @@
-from src.backbones import utae, unet3d, convlstm, convgru, fpn
+from src.backbones import utae, unet3d, convlstm, convgru, fpn, unet3plus
 from src.panoptic import paps
 
 
@@ -26,6 +26,14 @@ def get_model(config, mode="semantic"):
         elif config.model == "unet3d":
             model = unet3d.UNet3D(
                 in_channel=10, n_classes=config.num_classes, pad_value=config.pad_value
+            )
+        elif config.model == "unet3plus":
+            return unet3plus.UNet3Plus(
+                [10, 128, 128],
+                config.num_classes,
+                False,
+                False,
+                True,
             )
         elif config.model == "fpn":
             model = fpn.FPNConvLSTM(
