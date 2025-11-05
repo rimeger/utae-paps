@@ -123,7 +123,7 @@ class UNet3Plus(nn.Module):
             ] + [ConvBlock(self.filters[4], output_channels, n=1, is_bn=False, is_relu=False)]
         ) if self.deep_supervision else None
 
-    def forward(self, x) -> torch.Tensor:
+    def forward(self, x, batch_positions=None) -> torch.Tensor:
         training = self.training
         # Encoder
         e1 = self.e1(x)
