@@ -28,12 +28,20 @@ def get_model(config, mode="semantic"):
                 in_channel=10, n_classes=config.num_classes, pad_value=config.pad_value
             )
         elif config.model == "unet3plus":
-            return unet3plus.UNet3Plus(
-                [10, 128, 128],
-                config.num_classes,
-                False,
-                False,
-                True,
+            model = unet3plus.UTAE_UNet3P(
+                input_dim=10,
+                encoder_widths=config.encoder_widths,
+                decoder_widths=config.decoder_widths,
+                out_conv=config.out_conv,
+                str_conv_k=config.str_conv_k,
+                str_conv_s=config.str_conv_s,
+                str_conv_p=config.str_conv_p,
+                agg_mode=config.agg_mode,
+                encoder_norm=config.encoder_norm,
+                n_head=config.n_head,
+                d_model=config.d_model,
+                d_k=config.d_k,
+                pad_value=config.pad_value,
             )
         elif config.model == "fpn":
             model = fpn.FPNConvLSTM(
