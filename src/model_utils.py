@@ -28,7 +28,7 @@ def get_model(config, mode="semantic"):
                 in_channel=10, n_classes=config.num_classes, pad_value=config.pad_value
             )
         elif config.model == "unet3plus":
-            model = UNet3PlusTAE(
+            model = unet3plus.UNet3PlusTAE(
                 input_dim=10,
                 encoder_widths=config.encoder_widths,
                 out_conv=config.out_conv,
