@@ -15,7 +15,6 @@ class UNet3PlusTAE(nn.Module):
         self,
         input_dim,
         encoder_widths=[64, 64, 64, 128],
-        decoder_widths=[64, 64, 64, 128],  # Usually fixed width in UNet3+ (e.g. 64*5 = 320)
         out_conv=[32, 20],
         str_conv_k=4,
         str_conv_s=2,
@@ -29,18 +28,14 @@ class UNet3PlusTAE(nn.Module):
         return_maps=False,
         pad_value=0,
         padding_mode="reflect",
-        cat_channels=64, # Channels contributed by each scale to the fusion
+        cat_channels=64, 
     ):
         super(UNet3PlusTAE, self).__init__()
         self.n_stages = len(encoder_widths)
         self.return_maps = return_maps
         self.encoder_widths = encoder_widths
-        self.decoder_widths = decoder_widths
         self.pad_value = pad_value
         self.encoder = encoder
-        
-        # In UNet 3+, the decoder channel count is usually (n_stages + 1) * cat_channels
-        # But we adapt to valid decoder_widths if provided, or force cat_channels logic
         self.cat_channels = cat_channels
         
         # --- ENCODER ---
@@ -79,12 +74,12 @@ class UNet3PlusTAE(nn.Module):
         # --- DECODER (UNet 3+ Full Scale) ---
         self.up_blocks = nn.ModuleList()
         
-        # We build decoders from deep to shallow (excluding the bottleneck)
-        # i goes from n_stages-2 down to 0
-        for i in range(self.n_stages - 1, -1, -1):
+        # FIX: Loop from (n_stages - 2) down to 0. 
+        # Example: 4 stages (0,1,2,3). We need decoders for 2, 1, 0.
+        # Stage 3 is the bottleneck, it does not get a decoder block.
+        for i in range(self.n_stages - 2, -1, -1):
             
             # 1. Inputs from finer scales (Requires MaxPool)
-            # These inputs come from Encoder[0] ... Encoder[i-1]
             down_ops = nn.ModuleList()
             for j in range(i):
                 scale_factor = 2 ** (i - j)
@@ -98,7 +93,6 @@ class UNet3PlusTAE(nn.Module):
                 )
 
             # 2. Input from same scale (Direct)
-            # Encoder[i]
             same_op = nn.Sequential(
                 nn.Conv2d(encoder_widths[i], cat_channels, 3, padding=1),
                 nn.BatchNorm2d(cat_channels),
@@ -106,25 +100,13 @@ class UNet3PlusTAE(nn.Module):
             )
 
             # 3. Inputs from coarser scales (Requires Upsample)
-            # In standard UNet3+, we often just take the immediate deeper decoder output 
-            # because it already aggregates deeper features.
-            # Decoder[i+1]
-            if i == self.n_stages - 1:
-                # The "feature" below the last decoder block is the Bottleneck
+            # FIX: Logic for determining input channels for the upsampling
+            if i == self.n_stages - 2:
+                # The deepest decoder block receives input directly from the Bottleneck (LTAE)
                 prev_channels = encoder_widths[-1] 
             else:
-                # The feature below is the output of the previous UNet3+ block
-                # Output dim of a block is usually len(sources) * cat_channels
-                # Sources = (i finer encoders) + (1 same encoder) + (1 coarser decoder)
-                # = i + 1 + 1 = i + 2
-                # Note: This calc depends on how many larger scales we pull. 
-                # Standard UNet3+ pulls from ALL larger decoder scales. 
-                # For simplicity and GPU memory, we implement the "strict" version 
-                # taking only the immediate coarser decoder which implicitly carries the info.
-                prev_channels = (i + 2 + 1) * cat_channels # +1 because loop logic below
-                
-                # Actually, let's fix the output dim of every Decoder Block to be constant
-                # to make stacking easier, typically cat_channels * 5 (if 5 stages)
+                # Shallower decoder blocks receive input from the Previous Decoder Block
+                # Previous block output = (num_scales) * cat_channels
                 prev_channels = len(encoder_widths) * cat_channels
 
             up_op = nn.Sequential(
@@ -134,11 +116,11 @@ class UNet3PlusTAE(nn.Module):
                 nn.ReLU(inplace=True)
             )
 
-            # Total channels calculation for the fusion convolution
+            # Total input channels to the fusion convolution
             # Finer encoders (i) + Same encoder (1) + Coarser decoder (1)
             total_in_channels = (i + 1 + 1) * cat_channels
             
-            # The output of this block
+            # The output of this block (standardized size)
             block_out_channels = len(encoder_widths) * cat_channels
 
             block = UNet3PlusBlock(
@@ -149,10 +131,10 @@ class UNet3PlusTAE(nn.Module):
                 out_channels=block_out_channels,
                 norm="batch"
             )
-            self.up_blocks.insert(0, block) # Insert at 0 so ModuleList is ordered 0->Deep
+            # We insert at 0, so self.up_blocks[0] corresponds to Stage 0 (Resolution 0)
+            self.up_blocks.insert(0, block) 
 
         # --- OUT HEAD ---
-        # The final block output has shape (len(encoder_widths) * cat_channels)
         final_dim = len(encoder_widths) * cat_channels
         self.out_conv = ConvBlock(
             nkernels=[final_dim] + out_conv, 
@@ -162,63 +144,41 @@ class UNet3PlusTAE(nn.Module):
     def forward(self, input, batch_positions=None, return_att=False):
         pad_mask = (
             (input == self.pad_value).all(dim=-1).all(dim=-1).all(dim=-1)
-        )  # BxT pad mask
+        ) 
         
-        # --- SPATIAL ENCODER (Shared weights over time) ---
+        # --- SPATIAL ENCODER ---
         out = self.in_conv.smart_forward(input)
         encoder_features = [out] # E0
         
         for i in range(self.n_stages - 1):
             out = self.down_blocks[i].smart_forward(encoder_features[-1])
-            encoder_features.append(out) # E1, E2, ... E_last
+            encoder_features.append(out) # E1 ... E_last
         
-        # encoder_features contains [E0, E1, E2, E3, E4] (if 5 stages)
-        # All have shape (B, T, C, H, W)
-
         # --- TEMPORAL BOTTLENECK ---
-        # LTAE collapses time at the deepest level
-        # bottleneck_out: (B, C, H, W)
-        # att: (H, B, T, H, W) - Attention masks
         bottleneck_out, att = self.temporal_encoder(
             encoder_features[-1], batch_positions=batch_positions, pad_mask=pad_mask
         )
 
-        # --- SPATIAL DECODER (UNet 3+) ---
+        # --- SPATIAL DECODER ---
         if self.return_maps:
             maps = [bottleneck_out]
 
-        # We proceed from deepest decoder block up to resolution 0
-        # self.up_blocks was inserted 0..N, so we index carefully.
-        # We need to construct D_decoder given the encoder list.
-        
         current_decoder_out = bottleneck_out
         
-        # We iterate backwards through the resolution stages
-        # self.up_blocks is stored [Stage 0, Stage 1, Stage 2...]
-        # We want to execute Stage (N-2) -> Stage 0
-        
-        # Example 4 stages (0,1,2,3). 
-        # Encoders: E0, E1, E2, E3(bottleneck input).
-        # Bottleneck: D3.
-        # Decoders needed: D2, D1, D0.
-        
-        loop_indices = list(range(self.n_stages - 1)) # [0, 1, 2]
-        loop_indices.reverse() # [2, 1, 0]
+        # FIX: Iterate from Deepest Decoder (n_stages-2) up to Shallowest (0)
+        # self.up_blocks is indexed [Stage0, Stage1, Stage2...]
+        loop_indices = list(range(self.n_stages - 1)) # e.g., [0, 1, 2]
+        loop_indices.reverse() # e.g., [2, 1, 0]
         
         for i in loop_indices:
-            # Select the specific block for this stage
             block = self.up_blocks[i]
             
-            # Encoder features for this step:
-            # 1. Finer scales: encoder_features[0]...encoder_features[i-1]
+            # Finer scales: 0 to i-1
             finer_encs = encoder_features[:i]
             
-            # 2. Same scale: encoder_features[i]
+            # Same scale: i
             same_enc = encoder_features[i]
             
-            # 3. Coarser scale: current_decoder_out (starts as bottleneck, then becomes D_prev)
-            
-            # Perform the UNet3+ aggregation
             current_decoder_out = block(
                 finer_encs=finer_encs,
                 same_enc=same_enc,
