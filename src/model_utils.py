@@ -28,10 +28,9 @@ def get_model(config, mode="semantic"):
                 in_channel=10, n_classes=config.num_classes, pad_value=config.pad_value
             )
         elif config.model == "unet3plus":
-            model = unet3plus.UTAE_UNet3P(
+            model = UNet3PlusTAE(
                 input_dim=10,
                 encoder_widths=config.encoder_widths,
-                decoder_widths=config.decoder_widths,
                 out_conv=config.out_conv,
                 str_conv_k=config.str_conv_k,
                 str_conv_s=config.str_conv_s,
@@ -41,7 +40,11 @@ def get_model(config, mode="semantic"):
                 n_head=config.n_head,
                 d_model=config.d_model,
                 d_k=config.d_k,
+                encoder=False,
+                return_maps=False,
                 pad_value=config.pad_value,
+                padding_mode=config.padding_mode,
+                cat_channels=config.cat_channels,
             )
         elif config.model == "fpn":
             model = fpn.FPNConvLSTM(

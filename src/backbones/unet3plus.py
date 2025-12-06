@@ -1,330 +1,316 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-
 from src.backbones.ltae import LTAE2d
 
+# Reusing components from your snippet
+from .utae import (
+    ConvBlock,
+    ConvLayer,
+    DownConvBlock,
+    Temporal_Aggregator,
+)
 
-class ConvLayer(nn.Module):
-    def __init__(self, nkernels, norm="batch", k=3, s=1, p=1, n_groups=4, last_relu=True, padding_mode="reflect"):
-        super(ConvLayer, self).__init__()
-        layers = []
-        if norm == "batch":
-            nl = nn.BatchNorm2d
-        elif norm == "instance":
-            nl = nn.InstanceNorm2d
-        elif norm == "group":
-            nl = lambda num_feats: nn.GroupNorm(num_channels=num_feats, num_groups=n_groups)
-        else:
-            nl = None
-        for i in range(len(nkernels) - 1):
-            layers.append(nn.Conv2d(in_channels=nkernels[i], out_channels=nkernels[i + 1], kernel_size=k, padding=p, stride=s, padding_mode=padding_mode))
-            if nl is not None:
-                layers.append(nl(nkernels[i + 1]))
-            if last_relu:
-                layers.append(nn.ReLU(inplace=True))
-            elif i < len(nkernels) - 2:
-                layers.append(nn.ReLU(inplace=True))
-        self.conv = nn.Sequential(*layers)
-
-    def forward(self, input):
-        return self.conv(input)
-
-
-class TemporallySharedBlock(nn.Module):
-    """
-    Apply the same 2D block to inputs that are either 4D (B,C,H,W) or 5D (B,T,C,H,W).
-    This implementation robustly handles pad_value: it computes a mask over the merged
-    B*T frames and processes only valid frames to save compute and avoid indexing errors.
-    """
-    def __init__(self, pad_value=None):
-        super(TemporallySharedBlock, self).__init__()
-        self.out_shape = None
+class UNet3PlusTAE(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        encoder_widths=[64, 64, 64, 128],
+        decoder_widths=[64, 64, 64, 128],  # Usually fixed width in UNet3+ (e.g. 64*5 = 320)
+        out_conv=[32, 20],
+        str_conv_k=4,
+        str_conv_s=2,
+        str_conv_p=1,
+        agg_mode="att_group",
+        encoder_norm="group",
+        n_head=16,
+        d_model=256,
+        d_k=4,
+        encoder=False,
+        return_maps=False,
+        pad_value=0,
+        padding_mode="reflect",
+        cat_channels=64, # Channels contributed by each scale to the fusion
+    ):
+        super(UNet3PlusTAE, self).__init__()
+        self.n_stages = len(encoder_widths)
+        self.return_maps = return_maps
+        self.encoder_widths = encoder_widths
+        self.decoder_widths = decoder_widths
         self.pad_value = pad_value
+        self.encoder = encoder
+        
+        # In UNet 3+, the decoder channel count is usually (n_stages + 1) * cat_channels
+        # But we adapt to valid decoder_widths if provided, or force cat_channels logic
+        self.cat_channels = cat_channels
+        
+        # --- ENCODER ---
+        self.in_conv = ConvBlock(
+            nkernels=[input_dim] + [encoder_widths[0], encoder_widths[0]],
+            pad_value=pad_value,
+            norm=encoder_norm,
+            padding_mode=padding_mode,
+        )
+        
+        self.down_blocks = nn.ModuleList(
+            DownConvBlock(
+                d_in=encoder_widths[i],
+                d_out=encoder_widths[i + 1],
+                k=str_conv_k,
+                s=str_conv_s,
+                p=str_conv_p,
+                pad_value=pad_value,
+                norm=encoder_norm,
+                padding_mode=padding_mode,
+            )
+            for i in range(self.n_stages - 1)
+        )
 
-    def smart_forward(self, input):
-        if input.dim() == 4:
-            return self.forward(input)
-
-        b, t, c, h, w = input.shape
-        merged = input.view(b * t, c, h, w)  # (B*T, C, H, W)
-
-        if self.pad_value is None:
-            out_merged = self.forward(merged)
-            _, c2, h2, w2 = out_merged.shape
-            return out_merged.view(b, t, c2, h2, w2)
-
-        # Compute per-frame pad mask aligned with merged
-        pad_frame_mask = (merged == self.pad_value).all(dim=(1, 2, 3))  # (B*T,)
-
-        # If all frames are padded: return full pad_value output with proper shape
-        if pad_frame_mask.all():
-            if self.out_shape is None:
-                # infer out shape by running dummy
-                dummy = torch.zeros_like(merged)
-                tmp = self.forward(dummy)
-                self.out_shape = tmp.shape
-            c2, h2, w2 = self.out_shape[1], self.out_shape[2], self.out_shape[3]
-            return torch.full((b, t, c2, h2, w2), fill_value=self.pad_value, device=input.device, dtype=merged.dtype)
-
-        valid_idx = (~pad_frame_mask).nonzero(as_tuple=False).squeeze(1)
-        valid_merged = merged[valid_idx]
-
-        out_valid = self.forward(valid_merged)
-
-        if self.out_shape is None:
-            self.out_shape = out_valid.shape
-
-        N_total = b * t
-        C_out, H_out, W_out = out_valid.shape[1], out_valid.shape[2], out_valid.shape[3]
-        device = out_valid.device
-        dtype = out_valid.dtype
-
-        out_merged_full = torch.full((N_total, C_out, H_out, W_out), fill_value=self.pad_value, device=device, dtype=dtype)
-        out_merged_full[valid_idx] = out_valid
-
-        out = out_merged_full.view(b, t, C_out, H_out, W_out)
-        return out
-
-
-class ConvBlock(TemporallySharedBlock):
-    def __init__(self, nkernels, pad_value=None, norm="batch", last_relu=True, padding_mode="reflect"):
-        super(ConvBlock, self).__init__(pad_value=pad_value)
-        self.conv = ConvLayer(nkernels=nkernels, norm=norm, last_relu=last_relu, padding_mode=padding_mode)
-
-    def forward(self, input):
-        return self.conv(input)
-
-
-class DownConvBlock(TemporallySharedBlock):
-    def __init__(self, d_in, d_out, k, s, p, pad_value=None, norm="batch", padding_mode="reflect"):
-        super(DownConvBlock, self).__init__(pad_value=pad_value)
-        self.down = ConvLayer(nkernels=[d_in, d_in], norm=norm, k=k, s=s, p=p, padding_mode=padding_mode)
-        self.conv1 = ConvLayer(nkernels=[d_in, d_out], norm=norm, padding_mode=padding_mode)
-        self.conv2 = ConvLayer(nkernels=[d_out, d_out], norm=norm, padding_mode=padding_mode)
-
-    def forward(self, input):
-        out = self.down(input)
-        out = self.conv1(out)
-        out = out + self.conv2(out)
-        return out
-
-
-class UpConvBlock(nn.Module):
-    def __init__(self, d_in, d_out, k, s, p, norm="batch", d_skip=None, padding_mode="reflect"):
-        super(UpConvBlock, self).__init__()
-        d = d_out if d_skip is None else d_skip
-        self.skip_conv = nn.Sequential(nn.Conv2d(in_channels=d, out_channels=d, kernel_size=1), nn.BatchNorm2d(d), nn.ReLU(inplace=True))
-        self.up = nn.Sequential(nn.ConvTranspose2d(in_channels=d_in, out_channels=d_out, kernel_size=k, stride=s, padding=p), nn.BatchNorm2d(d_out), nn.ReLU(inplace=True))
-        self.conv1 = ConvLayer(nkernels=[d_out + d, d_out], norm=norm, padding_mode=padding_mode)
-        self.conv2 = ConvLayer(nkernels=[d_out, d_out], norm=norm, padding_mode=padding_mode)
-
-    def forward(self, input, skip):
-        out = self.up(input)
-        out = torch.cat([out, self.skip_conv(skip)], dim=1)
-        out = self.conv1(out)
-        out = out + self.conv2(out)
-        return out
-
-
-# -----------------------------
-# Temporal aggregator (supports att_group, att_mean, mean)
-# -----------------------------
-class Temporal_Aggregator(nn.Module):
-    def __init__(self, mode="att_group"):
-        super(Temporal_Aggregator, self).__init__()
-        assert mode in ("att_group", "att_mean", "mean")
-        self.mode = mode
-
-    def forward(self, x, pad_mask=None, attn_mask=None):
-        # x: (B, T, C, H, W)
-        if pad_mask is not None and pad_mask.any():
-            if self.mode == "att_group":
-                # attn_mask: n_head x B x T x H_att x W_att
-                n_heads, b, t, h_att, w_att = attn_mask.shape
-                attn = attn_mask.view(n_heads * b, t, h_att, w_att)
-
-                if x.shape[-2] > h_att:
-                    attn = nn.Upsample(size=x.shape[-2:], mode="bilinear", align_corners=False)(attn)
-                else:
-                    pool_k = max(1, w_att // x.shape[-2])
-                    attn = nn.AvgPool2d(kernel_size=pool_k)(attn)
-
-                attn = attn.view(n_heads, b, t, *x.shape[-2:])
-                attn = attn * (~pad_mask).float()[None, :, :, None, None]
-
-                out = torch.stack(x.chunk(n_heads, dim=2))  # hxBxTxC_hxHxW
-                out = attn[:, :, :, None, :, :] * out
-                out = out.sum(dim=2)  # sum on temporal dim -> hxBxC_hxHxW
-                out = torch.cat([group for group in out], dim=1)  # -> BxCxHxW
-                return out
-            elif self.mode == "att_mean":
-                attn = attn_mask.mean(dim=0)  # B x T x H_att x W_att
-                attn = nn.Upsample(size=x.shape[-2:], mode="bilinear", align_corners=False)(attn)
-                attn = attn * (~pad_mask).float()[:, :, None, None]
-                out = (x * attn[:, :, None, :, :]).sum(dim=1)
-                return out
-            elif self.mode == "mean":
-                out = x * (~pad_mask).float()[:, :, None, None, None]
-                out = out.sum(dim=1) / (~pad_mask).sum(dim=1)[:, None, None, None]
-                return out
-        else:
-            if self.mode == "att_group":
-                n_heads, b, t, h_att, w_att = attn_mask.shape
-                attn = attn_mask.view(n_heads * b, t, h_att, w_att)
-                if x.shape[-2] > h_att:
-                    attn = nn.Upsample(size=x.shape[-2:], mode="bilinear", align_corners=False)(attn)
-                else:
-                    pool_k = max(1, w_att // x.shape[-2])
-                    attn = nn.AvgPool2d(kernel_size=pool_k)(attn)
-                attn = attn.view(n_heads, b, t, *x.shape[-2:])
-                out = torch.stack(x.chunk(n_heads, dim=2))
-                out = attn[:, :, :, None, :, :] * out
-                out = out.sum(dim=2)
-                out = torch.cat([group for group in out], dim=1)
-                return out
-            elif self.mode == "att_mean":
-                attn = attn_mask.mean(dim=0)
-                attn = nn.Upsample(size=x.shape[-2:], mode="bilinear", align_corners=False)(attn)
-                out = (x * attn[:, :, None, :, :]).sum(dim=1)
-                return out
-            elif self.mode == "mean":
-                return x.mean(dim=1)
-
-
-# -----------------------------
-# Full UNet3+ encoder/decoder with multi-level LTAE
-# -----------------------------
-class UNet3P_Encoder(nn.Module):
-    def __init__(self, in_ch, widths, pad_value=None, norm="group"):
-        super(UNet3P_Encoder, self).__init__()
-        self.n_levels = len(widths)
-        self.pad_value = pad_value
-        self.in_conv = ConvBlock(nkernels=[in_ch, widths[0], widths[0]], pad_value=pad_value, norm=norm)
-        self.down_blocks = nn.ModuleList()
-        for i in range(self.n_levels - 1):
-            self.down_blocks.append(DownConvBlock(d_in=widths[i], d_out=widths[i + 1], k=4, s=2, p=1, pad_value=pad_value, norm=norm))
-
-    def forward(self, x):
-        # x can be (B,C,H,W) or (B,T,C,H,W)
-        out = self.in_conv.smart_forward(x)
-        feats = [out]
-        for blk in self.down_blocks:
-            out = blk.smart_forward(feats[-1])
-            feats.append(out)
-        # feats: list length n_levels, each either (B,C,H,W) or (B,T,C,H,W)
-        return feats
-
-
-class UNet3P_DecoderStage(nn.Module):
-    """
-    Decoder stage that fuses multi-scale features as in UNet3+. For simplicity we implement a fusion by
-    projecting each input feature to a common channel count and up/downsampling to the target resolution.
-    """
-    def __init__(self, widths, target_idx, proj_ch, padding_mode="reflect"):
-        super(UNet3P_DecoderStage, self).__init__()
-        self.target_idx = target_idx
-        self.n_levels = len(widths)
-        self.proj_convs = nn.ModuleList()
-        for i, w in enumerate(widths):
-            # projection conv to proj_ch
-            self.proj_convs.append(nn.Sequential(nn.Conv2d(w, proj_ch, kernel_size=1), nn.BatchNorm2d(proj_ch), nn.ReLU(inplace=True)))
-        # after concatenation
-        self.fuse = ConvLayer(nkernels=[proj_ch * self.n_levels, proj_ch], norm="batch")
-
-    def forward(self, feats):
-        # feats: list of tensors at different scales; each tensor is (B, C_i, H_i, W_i)
-        target = feats[self.target_idx]
-        Ht, Wt = target.shape[-2], target.shape[-1]
-        ups = []
-        for i, f in enumerate(feats):
-            p = self.proj_convs[i](f)
-            if f.shape[-2] != Ht:
-                p = F.interpolate(p, size=(Ht, Wt), mode='bilinear', align_corners=False)
-            ups.append(p)
-        cat = torch.cat(ups, dim=1)
-        return self.fuse(cat)
-
-
-class UNet3P_Full(nn.Module):
-    def __init__(self, input_dim=10, encoder_widths=[64,128,256,512,512], decoder_proj=128, num_classes=20, pad_value=0, n_head=16, d_model=256, d_k=4, agg_mode='att_group', deep_supervision=False):
-        super(UNet3P_Full, self).__init__()
-        self.pad_value = pad_value
-        self.n_levels = len(encoder_widths)
-        self.encoder = UNet3P_Encoder(in_ch=input_dim, widths=encoder_widths, pad_value=pad_value, norm="group")
-
-        # Multi-level temporal encoders (LTAE) - one per encoder level
-        self.temporal_encoders = nn.ModuleList()
-        for i in range(self.n_levels):
-            ch = encoder_widths[i]
-            self.temporal_encoders.append(LTAE2d(in_channels=ch, d_model=d_model, n_head=n_head, mlp=[d_model, ch], return_att=True, d_k=d_k))
-
-        # Temporal aggregator used for skips
+        # --- TEMPORAL BOTTLENECK ---
+        self.temporal_encoder = LTAE2d(
+            in_channels=encoder_widths[-1],
+            d_model=d_model,
+            n_head=n_head,
+            mlp=[d_model, encoder_widths[-1]],
+            return_att=True,
+            d_k=d_k,
+        )
         self.temporal_aggregator = Temporal_Aggregator(mode=agg_mode)
 
-        # Decoder stages - produce fused features at each level
-        self.decoder_stages = nn.ModuleList()
-        for i in range(self.n_levels):
-            self.decoder_stages.append(UNet3P_DecoderStage(encoder_widths, target_idx=i, proj_ch=decoder_proj))
+        # --- DECODER (UNet 3+ Full Scale) ---
+        self.up_blocks = nn.ModuleList()
+        
+        # We build decoders from deep to shallow (excluding the bottleneck)
+        # i goes from n_stages-2 down to 0
+        for i in range(self.n_stages - 1, -1, -1):
+            
+            # 1. Inputs from finer scales (Requires MaxPool)
+            # These inputs come from Encoder[0] ... Encoder[i-1]
+            down_ops = nn.ModuleList()
+            for j in range(i):
+                scale_factor = 2 ** (i - j)
+                down_ops.append(
+                    nn.Sequential(
+                        nn.MaxPool2d(kernel_size=scale_factor, stride=scale_factor, ceil_mode=True),
+                        nn.Conv2d(encoder_widths[j], cat_channels, 3, padding=1),
+                        nn.BatchNorm2d(cat_channels),
+                        nn.ReLU(inplace=True)
+                    )
+                )
 
-        # final conv head
-        self.final_head = nn.Sequential(nn.Conv2d(decoder_proj, decoder_proj//2, 3, padding=1), nn.BatchNorm2d(decoder_proj//2), nn.ReLU(inplace=True), nn.Conv2d(decoder_proj//2, num_classes, 1))
+            # 2. Input from same scale (Direct)
+            # Encoder[i]
+            same_op = nn.Sequential(
+                nn.Conv2d(encoder_widths[i], cat_channels, 3, padding=1),
+                nn.BatchNorm2d(cat_channels),
+                nn.ReLU(inplace=True)
+            )
 
-        self.deep_supervision = deep_supervision
-        if self.deep_supervision:
-            self.deep_heads = nn.ModuleList([nn.Conv2d(decoder_proj, num_classes, 1) for _ in range(self.n_levels)])
-
-    def forward(self, x, batch_positions=None, return_att=False):
-        """
-        x: (B, T, C, H, W)
-        batch_positions: (B, T) or None
-        returns: (B, num_classes, H, W) or (out, att_dict) if return_att=True
-        """
-        pad_mask = (x == self.pad_value).all(dim=-1).all(dim=-1).all(dim=-1)  # BxT
-
-        # SPATIAL ENCODER (shared convs across time)
-        feats = self.encoder.forward(x)  # list len n_levels, each (B,T,C_i,H_i,W_i)
-
-        # TEMPORAL ENCODER applied at each level
-        emb_per_level = []
-        att_per_level = []
-        for lvl, (feat, tenc) in enumerate(zip(feats, self.temporal_encoders)):
-            # feat: (B,T,C,H,W)
-            emb, att = tenc(feat, batch_positions=batch_positions, pad_mask=pad_mask)
-            # emb: (B,C,H,W), att: (n_head, B, T, H_att, W_att)
-            emb_per_level.append(emb)
-            att_per_level.append(att)
-
-        # TEMPORAL AGGREGATION for skips depends on the attn per level
-        # Build list of aggregated skip features (same resolution as encoder features)
-        skip_aggregated = []
-        for lvl in range(self.n_levels):
-            # for deepest level, emb_per_level already is the embedding
-            if lvl == self.n_levels - 1:
-                skip_aggregated.append(emb_per_level[lvl])
+            # 3. Inputs from coarser scales (Requires Upsample)
+            # In standard UNet3+, we often just take the immediate deeper decoder output 
+            # because it already aggregates deeper features.
+            # Decoder[i+1]
+            if i == self.n_stages - 1:
+                # The "feature" below the last decoder block is the Bottleneck
+                prev_channels = encoder_widths[-1] 
             else:
-                agg = self.temporal_aggregator(feats[lvl], pad_mask=pad_mask, attn_mask=att_per_level[lvl])
-                skip_aggregated.append(agg)
+                # The feature below is the output of the previous UNet3+ block
+                # Output dim of a block is usually len(sources) * cat_channels
+                # Sources = (i finer encoders) + (1 same encoder) + (1 coarser decoder)
+                # = i + 1 + 1 = i + 2
+                # Note: This calc depends on how many larger scales we pull. 
+                # Standard UNet3+ pulls from ALL larger decoder scales. 
+                # For simplicity and GPU memory, we implement the "strict" version 
+                # taking only the immediate coarser decoder which implicitly carries the info.
+                prev_channels = (i + 2 + 1) * cat_channels # +1 because loop logic below
+                
+                # Actually, let's fix the output dim of every Decoder Block to be constant
+                # to make stacking easier, typically cat_channels * 5 (if 5 stages)
+                prev_channels = len(encoder_widths) * cat_channels
 
-        # Now decode using UNet3+ style dense fusion but using aggregated skips
-        # For UNet3+ fusion, each decoder stage fuses ALL skip_aggregated levels resized to target resolution.
-        decoded_per_level = [None] * self.n_levels
-        for i in range(self.n_levels - 1, -1, -1):
-            # prepare list of feats at each level for fusion; use current available decoded_per_level entries if present
-            fusion_inputs = []
-            for lvl in range(self.n_levels):
-                # base feature for level lvl: if we've decoded a finer representation for that level, use it; else use skip_aggregated
-                base = skip_aggregated[lvl] if decoded_per_level[lvl] is None else decoded_per_level[lvl]
-                fusion_inputs.append(base)
-            # fuse to produce feature at level i
-            decoded = self.decoder_stages[i](fusion_inputs)
-            decoded_per_level[i] = decoded
+            up_op = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+                nn.Conv2d(prev_channels, cat_channels, 3, padding=1),
+                nn.BatchNorm2d(cat_channels),
+                nn.ReLU(inplace=True)
+            )
 
-        out = self.final_head(decoded_per_level[0])
+            # Total channels calculation for the fusion convolution
+            # Finer encoders (i) + Same encoder (1) + Coarser decoder (1)
+            total_in_channels = (i + 1 + 1) * cat_channels
+            
+            # The output of this block
+            block_out_channels = len(encoder_widths) * cat_channels
 
+            block = UNet3PlusBlock(
+                down_ops=down_ops,
+                same_op=same_op,
+                up_op=up_op,
+                in_channels=total_in_channels,
+                out_channels=block_out_channels,
+                norm="batch"
+            )
+            self.up_blocks.insert(0, block) # Insert at 0 so ModuleList is ordered 0->Deep
+
+        # --- OUT HEAD ---
+        # The final block output has shape (len(encoder_widths) * cat_channels)
+        final_dim = len(encoder_widths) * cat_channels
+        self.out_conv = ConvBlock(
+            nkernels=[final_dim] + out_conv, 
+            padding_mode=padding_mode
+        )
+
+    def forward(self, input, batch_positions=None, return_att=False):
+        pad_mask = (
+            (input == self.pad_value).all(dim=-1).all(dim=-1).all(dim=-1)
+        )  # BxT pad mask
+        
+        # --- SPATIAL ENCODER (Shared weights over time) ---
+        out = self.in_conv.smart_forward(input)
+        encoder_features = [out] # E0
+        
+        for i in range(self.n_stages - 1):
+            out = self.down_blocks[i].smart_forward(encoder_features[-1])
+            encoder_features.append(out) # E1, E2, ... E_last
+        
+        # encoder_features contains [E0, E1, E2, E3, E4] (if 5 stages)
+        # All have shape (B, T, C, H, W)
+
+        # --- TEMPORAL BOTTLENECK ---
+        # LTAE collapses time at the deepest level
+        # bottleneck_out: (B, C, H, W)
+        # att: (H, B, T, H, W) - Attention masks
+        bottleneck_out, att = self.temporal_encoder(
+            encoder_features[-1], batch_positions=batch_positions, pad_mask=pad_mask
+        )
+
+        # --- SPATIAL DECODER (UNet 3+) ---
+        if self.return_maps:
+            maps = [bottleneck_out]
+
+        # We proceed from deepest decoder block up to resolution 0
+        # self.up_blocks was inserted 0..N, so we index carefully.
+        # We need to construct D_decoder given the encoder list.
+        
+        current_decoder_out = bottleneck_out
+        
+        # We iterate backwards through the resolution stages
+        # self.up_blocks is stored [Stage 0, Stage 1, Stage 2...]
+        # We want to execute Stage (N-2) -> Stage 0
+        
+        # Example 4 stages (0,1,2,3). 
+        # Encoders: E0, E1, E2, E3(bottleneck input).
+        # Bottleneck: D3.
+        # Decoders needed: D2, D1, D0.
+        
+        loop_indices = list(range(self.n_stages - 1)) # [0, 1, 2]
+        loop_indices.reverse() # [2, 1, 0]
+        
+        for i in loop_indices:
+            # Select the specific block for this stage
+            block = self.up_blocks[i]
+            
+            # Encoder features for this step:
+            # 1. Finer scales: encoder_features[0]...encoder_features[i-1]
+            finer_encs = encoder_features[:i]
+            
+            # 2. Same scale: encoder_features[i]
+            same_enc = encoder_features[i]
+            
+            # 3. Coarser scale: current_decoder_out (starts as bottleneck, then becomes D_prev)
+            
+            # Perform the UNet3+ aggregation
+            current_decoder_out = block(
+                finer_encs=finer_encs,
+                same_enc=same_enc,
+                prev_decoder=current_decoder_out,
+                temporal_aggregator=self.temporal_aggregator,
+                att_mask=att,
+                pad_mask=pad_mask
+            )
+            
+            if self.return_maps:
+                maps.append(current_decoder_out)
+
+        # --- OUTPUT ---
+        if self.encoder:
+             return current_decoder_out, maps
+        
+        out = self.out_conv(current_decoder_out)
+        
         if return_att:
-            att_dict = {f"att_level_{i}": att_per_level[i] for i in range(len(att_per_level))}
-            return out, att_dict
-        else:
-            return out
+            return out, att
+        if self.return_maps:
+            return out, maps
+        return out
+
+
+class UNet3PlusBlock(nn.Module):
+    """
+    A single scale aggregation block for UNet 3+.
+    It handles:
+    1. Downsampling and processing finer encoder scales.
+    2. Processing the same encoder scale.
+    3. Upsampling the coarser decoder scale.
+    4. Temporally aggregating ALL encoder inputs using the mask from the bottleneck.
+    5. Concatenating and fusing.
+    """
+    def __init__(self, down_ops, same_op, up_op, in_channels, out_channels, norm="batch"):
+        super(UNet3PlusBlock, self).__init__()
+        self.down_ops = down_ops # List of operations for inputs E_0 ... E_{i-1}
+        self.same_op = same_op   # Operation for E_i
+        self.up_op = up_op       # Operation for D_{i+1}
+        
+        self.fusion = ConvLayer(
+            nkernels=[in_channels, out_channels],
+            norm=norm,
+            k=3, s=1, p=1
+        )
+
+    def forward(self, finer_encs, same_enc, prev_decoder, temporal_aggregator, att_mask, pad_mask):
+        """
+        finer_encs: List of (B, T, C, H_k, W_k)
+        same_enc: (B, T, C, H, W)
+        prev_decoder: (B, C, H_prev, W_prev) - Already time-collapsed
+        """
+        
+        feature_list = []
+        
+        # 1. Process Finer Scales (Downsample -> Conv -> Time Aggregate)
+        # We must reshape B,T into B*T for the Conv2d ops, then back for aggregation
+        for idx, feat in enumerate(finer_encs):
+            b, t, c, h, w = feat.shape
+            
+            # Merge dims for spatial operation (Maxpool + Conv)
+            x = feat.view(b * t, c, h, w)
+            x = self.down_ops[idx](x) 
+            
+            # Reshape back to apply temporal attention
+            _, c_new, h_new, w_new = x.shape
+            x = x.view(b, t, c_new, h_new, w_new)
+            
+            # Aggregate Time
+            x = temporal_aggregator(x, pad_mask=pad_mask, attn_mask=att_mask)
+            feature_list.append(x)
+
+        # 2. Process Same Scale (Conv -> Time Aggregate)
+        b, t, c, h, w = same_enc.shape
+        x = same_enc.view(b * t, c, h, w)
+        x = self.same_op(x)
+        _, c_new, h_new, w_new = x.shape
+        x = x.view(b, t, c_new, h_new, w_new)
+        
+        x = temporal_aggregator(x, pad_mask=pad_mask, attn_mask=att_mask)
+        feature_list.append(x)
+
+        # 3. Process Coarser Scale (Upsample -> Conv)
+        # This is already time-collapsed (it comes from the bottleneck or deeper decoder)
+        x = self.up_op(prev_decoder)
+        feature_list.append(x)
+        
+        # 4. Concatenate
+        out = torch.cat(feature_list, dim=1)
+        
+        # 5. Fuse
+        out = self.fusion(out)
+        
+        return out

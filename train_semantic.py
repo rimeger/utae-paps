@@ -112,10 +112,10 @@ parser.add_argument(
     help="Exponent for learning rate scheduler"
 )
 parser.add_argument(
-    "--lr_mode",
-    default=None,
-    type=str,
-    help="Mode for learning rate scheduler. options: 511, 512, poly, or None"
+    "--cat_channels",
+    default=64,
+    type=int,
+    help="Number of channels contributed by each scale to the fusion in UNet3+",
 )
 
 list_args = ["encoder_widths", "decoder_widths", "out_conv"]
