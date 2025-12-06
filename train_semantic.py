@@ -112,6 +112,12 @@ parser.add_argument(
     help="Exponent for learning rate scheduler"
 )
 parser.add_argument(
+    "--lr_mode",
+    default=None,
+    type=str,
+    help="Mode for learning rate scheduler. options: 511, 512, poly, or None"
+)
+parser.add_argument(
     "--cat_channels",
     default=64,
     type=int,
