@@ -123,8 +123,20 @@ parser.add_argument(
     type=int,
     help="Number of channels contributed by each scale to the fusion in UNet3+",
 )
+parser.add_argument(
+    "--low_level_idx",
+    default=1,
+    type=int,
+    help="Selects which layer to use as low level features in DeepLabV3+",
+)
+parser.add_argument(
+    "--aspp_rates",
+    default="[6, 12, 18]",
+    type=str,
+    help="ASPP rates for DeepLabV3+",
+)
 
-list_args = ["encoder_widths", "decoder_widths", "out_conv"]
+list_args = ["encoder_widths", "decoder_widths", "out_conv", "aspp_rates"]
 parser.set_defaults(cache=False)
 
 

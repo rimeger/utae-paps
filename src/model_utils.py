@@ -1,4 +1,4 @@
-from src.backbones import utae, unet3d, convlstm, convgru, fpn, unet3plus
+from src.backbones import utae, unet3d, convlstm, convgru, fpn, unet3plus, deeplab3plus
 from src.panoptic import paps
 
 
@@ -45,6 +45,26 @@ def get_model(config, mode="semantic"):
                 pad_value=config.pad_value,
                 padding_mode=config.padding_mode,
                 cat_channels=config.cat_channels,
+            )
+        elif config.model == "deeplab3plus":
+            model = deeplab3plus.DeepLabV3PlusTAE(
+                input_dim=10,
+                encoder_widths=config.encoder_widths,
+                out_conv=config.out_conv,
+                str_conv_k=config.str_conv_k,
+                str_conv_s=config.str_conv_s,
+                str_conv_p=config.str_conv_p,
+                agg_mode=config.agg_mode,
+                encoder_norm=config.encoder_norm,
+                n_head=config.n_head,
+                d_model=config.d_model,
+                d_k=config.d_k,
+                encoder=False,
+                return_maps=False,
+                pad_value=config.pad_value,
+                padding_mode=config.padding_mode,
+                low_level_idx=1,
+                aspp_rates=[6, 12, 18]
             )
         elif config.model == "fpn":
             model = fpn.FPNConvLSTM(
